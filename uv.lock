@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 
 [[package]]
@@ -383,6 +383,7 @@ dependencies = [
     { name = "httpx" },
     { name = "mcp" },
     { name = "msal" },
+    { name = "python-dotenv" },
 ]
 
 [package.metadata]
@@ -391,6 +392,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.25.0" },
     { name = "mcp", specifier = ">=1.2.0" },
     { name = "msal", specifier = ">=1.25.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
 ]
 
 [package.metadata.requires-dev]

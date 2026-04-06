@@ -13,9 +13,13 @@ import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import time
+from dotenv import load_dotenv
 from msal import ConfidentialClientApplication, PublicClientApplication
 import httpx
 from fastmcp import FastMCP
+
+# Load .env file if present (env vars set by Claude Desktop take precedence)
+load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +35,11 @@ SCOPES = [
     "https://graph.microsoft.com/Notes.ReadWrite",
     "https://graph.microsoft.com/User.Read"
 ]
+
+# Tenant / SharePoint configuration
+TENANT_ID = os.getenv("AZURE_TENANT_ID", "common")
+SHAREPOINT_HOST = os.getenv("SHAREPOINT_HOST", "")
+SHAREPOINT_USER_PATH = os.getenv("SHAREPOINT_USER_PATH", "")
 
 # Token cache configuration
 TOKEN_CACHE_ENABLED = os.getenv("ONENOTE_CACHE_TOKENS", "true").lower() in ("true", "1", "yes")
@@ -157,7 +166,7 @@ async def manual_token_refresh() -> bool:
         client_id = get_client_id()
         
         # Microsoft token endpoint
-        token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
         
         # Prepare refresh token request
         data = {
@@ -200,7 +209,7 @@ def init_msal_app(client_id: str) -> PublicClientApplication:
     # Create a simple in-memory cache for MSAL
     return PublicClientApplication(
         client_id=client_id,
-        authority="https://login.microsoftonline.com/common"
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}"
     )
 
 async def ensure_valid_token() -> bool:
@@ -403,14 +412,14 @@ async def make_graph_request(endpoint: str, method: str = "GET", data: Dict = No
     # Ensure we have a valid token before making the request
     if not await ensure_valid_token():
         raise Exception("Not authenticated. Please call 'start_authentication' and 'complete_authentication' first.")
-    
+
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
-    
+
     url = f"{GRAPH_BASE_URL}{endpoint}"
-    
+
     async with httpx.AsyncClient() as client:
         if method == "GET":
             response = await client.get(url, headers=headers)
@@ -420,37 +429,99 @@ async def make_graph_request(endpoint: str, method: str = "GET", data: Dict = No
             response = await client.patch(url, headers=headers, json=data)
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
-    
+
     if response.status_code >= 400:
         raise Exception(f"Graph API error: {response.status_code} - {response.text}")
-    
+
     return response.json()
+
+async def make_graph_request_binary(endpoint: str) -> bytes:
+    """Make a Graph API request that returns binary content (images, files)."""
+    if not await ensure_valid_token():
+        raise Exception("Not authenticated.")
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    url = f"{GRAPH_BASE_URL}{endpoint}"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers)
+
+    if response.status_code >= 400:
+        raise Exception(f"Graph API error: {response.status_code} - {response.text}")
+
+    return response.content
+
+# Cache for resolved SharePoint site ID
+_sharepoint_site_id: Optional[str] = None
+
+async def get_sharepoint_site_id() -> Optional[str]:
+    """Resolve and cache the SharePoint personal site ID for OneNote queries."""
+    global _sharepoint_site_id
+
+    if _sharepoint_site_id:
+        return _sharepoint_site_id
+
+    if not SHAREPOINT_HOST or not SHAREPOINT_USER_PATH:
+        return None
+
+    try:
+        site_path = SHAREPOINT_USER_PATH.lstrip("/")
+        result = await make_graph_request(f"/sites/{SHAREPOINT_HOST}:/{site_path}")
+        _sharepoint_site_id = result.get("id")
+        logger.info(f"Resolved SharePoint site ID: {_sharepoint_site_id}")
+        return _sharepoint_site_id
+    except Exception as e:
+        logger.warning(f"Could not resolve SharePoint site ID: {e}")
+        return None
 
 @mcp.tool()
 async def list_notebooks() -> str:
     """
-    List all OneNote notebooks.
-    
+    List all OneNote notebooks, including SharePoint-backed notebooks.
+
     Returns:
         JSON string containing notebook information
     """
     try:
-        logger.info("Making request to /me/onenote/notebooks")
-        notebooks = await make_graph_request("/me/onenote/notebooks")
-        logger.info(f"Graph API response received with {len(notebooks.get('value', []))} notebooks")
-        
+        seen_ids = set()
         result = []
-        for notebook in notebooks.get("value", []):
-            result.append({
-                "id": notebook.get("id"),
-                "name": notebook.get("displayName"),
-                "created": notebook.get("createdDateTime"),
-                "modified": notebook.get("lastModifiedDateTime")
-            })
-        
-        logger.info(f"Returning {len(result)} notebooks")
+
+        def add_notebooks(raw_list):
+            for notebook in raw_list:
+                nb_id = notebook.get("id")
+                if nb_id and nb_id not in seen_ids:
+                    seen_ids.add(nb_id)
+                    result.append({
+                        "id": nb_id,
+                        "name": notebook.get("displayName"),
+                        "created": notebook.get("createdDateTime"),
+                        "modified": notebook.get("lastModifiedDateTime")
+                    })
+
+        # Personal OneDrive notebooks
+        logger.info("Fetching personal notebooks from /me/onenote/notebooks")
+        try:
+            personal = await make_graph_request("/me/onenote/notebooks")
+            add_notebooks(personal.get("value", []))
+            logger.info(f"Found {len(result)} personal notebooks")
+        except Exception as e:
+            logger.warning(f"Could not fetch personal notebooks: {e}")
+
+        # SharePoint-backed notebooks
+        site_id = await get_sharepoint_site_id()
+        if site_id:
+            logger.info(f"Fetching SharePoint notebooks from /sites/{site_id}/onenote/notebooks")
+            try:
+                sp_notebooks = await make_graph_request(f"/sites/{site_id}/onenote/notebooks")
+                before = len(result)
+                add_notebooks(sp_notebooks.get("value", []))
+                logger.info(f"Found {len(result) - before} additional SharePoint notebooks")
+            except Exception as e:
+                logger.warning(f"Could not fetch SharePoint notebooks: {e}")
+
+        logger.info(f"Returning {len(result)} total notebooks")
         return json.dumps(result, indent=2)
-    
+
     except Exception as e:
         logger.error(f"Error in list_notebooks: {str(e)}")
         return f"Error listing notebooks: {str(e)}"
@@ -459,86 +530,191 @@ async def list_notebooks() -> str:
 async def list_sections(notebook_id: str) -> str:
     """
     List sections in a specific notebook.
-    
+
     Args:
         notebook_id: ID of the notebook to list sections from
-    
+
     Returns:
         JSON string containing section information
     """
+    def parse_sections(raw_list):
+        return [
+            {
+                "id": s.get("id"),
+                "name": s.get("displayName"),
+                "created": s.get("createdDateTime"),
+                "modified": s.get("lastModifiedDateTime")
+            }
+            for s in raw_list
+        ]
+
     try:
         sections = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sections")
-        
-        result = []
-        for section in sections.get("value", []):
-            result.append({
-                "id": section.get("id"),
-                "name": section.get("displayName"),
-                "created": section.get("createdDateTime"),
-                "modified": section.get("lastModifiedDateTime")
-            })
-        
-        return json.dumps(result, indent=2)
-    
-    except Exception as e:
-        return f"Error listing sections: {str(e)}"
+        return json.dumps(parse_sections(sections.get("value", [])), indent=2)
+    except Exception as personal_err:
+        # Fall back to SharePoint endpoint
+        site_id = await get_sharepoint_site_id()
+        if site_id:
+            try:
+                sections = await make_graph_request(
+                    f"/sites/{site_id}/onenote/notebooks/{notebook_id}/sections"
+                )
+                return json.dumps(parse_sections(sections.get("value", [])), indent=2)
+            except Exception as sp_err:
+                return f"Error listing sections (personal: {personal_err}; sharepoint: {sp_err})"
+        return f"Error listing sections: {personal_err}"
 
 @mcp.tool()
 async def list_pages(section_id: str) -> str:
     """
     List pages in a specific section.
-    
+
     Args:
         section_id: ID of the section to list pages from
-    
+
     Returns:
         JSON string containing page information
     """
+    def parse_pages(raw_list):
+        return [
+            {
+                "id": p.get("id"),
+                "title": p.get("title"),
+                "created": p.get("createdDateTime"),
+                "modified": p.get("lastModifiedDateTime"),
+                "content_url": p.get("contentUrl")
+            }
+            for p in raw_list
+        ]
+
     try:
         pages = await make_graph_request(f"/me/onenote/sections/{section_id}/pages")
-        
-        result = []
-        for page in pages.get("value", []):
-            result.append({
-                "id": page.get("id"),
-                "title": page.get("title"),
-                "created": page.get("createdDateTime"),
-                "modified": page.get("lastModifiedDateTime"),
-                "content_url": page.get("contentUrl")
-            })
-        
-        return json.dumps(result, indent=2)
-    
-    except Exception as e:
-        return f"Error listing pages: {str(e)}"
+        return json.dumps(parse_pages(pages.get("value", [])), indent=2)
+    except Exception as personal_err:
+        site_id = await get_sharepoint_site_id()
+        if site_id:
+            try:
+                pages = await make_graph_request(
+                    f"/sites/{site_id}/onenote/sections/{section_id}/pages"
+                )
+                return json.dumps(parse_pages(pages.get("value", [])), indent=2)
+            except Exception as sp_err:
+                return f"Error listing pages (personal: {personal_err}; sharepoint: {sp_err})"
+        return f"Error listing pages: {personal_err}"
 
 @mcp.tool()
 async def get_page_content(page_id: str) -> str:
     """
     Get the content of a specific page.
-    
+
     Args:
         page_id: ID of the page to retrieve content from
-    
+
     Returns:
         Page content as HTML or error message
     """
-    try:
-        # Get page content (returns HTML)
+    if not await ensure_valid_token():
+        return "Error: Not authenticated."
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    async def fetch_content(url: str) -> Optional[str]:
         async with httpx.AsyncClient() as client:
-            headers = {"Authorization": f"Bearer {access_token}"}
-            response = await client.get(
-                f"{GRAPH_BASE_URL}/me/onenote/pages/{page_id}/content",
-                headers=headers
-            )
-            
-            if response.status_code >= 400:
-                return f"Error getting page content: {response.status_code} - {response.text}"
-            
+            response = await client.get(url, headers=headers)
+        if response.status_code < 400:
             return response.text
-    
-    except Exception as e:
-        return f"Error getting page content: {str(e)}"
+        return None
+
+    # Try personal endpoint first
+    content = await fetch_content(f"{GRAPH_BASE_URL}/me/onenote/pages/{page_id}/content")
+    if content is not None:
+        return content
+
+    # Fall back to SharePoint endpoint
+    site_id = await get_sharepoint_site_id()
+    if site_id:
+        content = await fetch_content(
+            f"{GRAPH_BASE_URL}/sites/{site_id}/onenote/pages/{page_id}/content"
+        )
+        if content is not None:
+            return content
+
+    return f"Error getting page content: page {page_id} not found via personal or SharePoint endpoints"
+
+@mcp.tool()
+async def get_page_resources(page_id: str) -> str:
+    """
+    Fetch and save all image/attachment resources embedded in a OneNote page.
+
+    Useful for pages with handwritten ink (Boox) or embedded images that don't
+    render as plain text.  Saves each resource as a file under
+    ~/.onenote_mcp_cache/<page_id>/ and returns a manifest of the saved paths.
+
+    Args:
+        page_id: ID of the OneNote page
+
+    Returns:
+        JSON manifest of saved resource files with their local paths and MIME types
+    """
+    import re
+    import mimetypes
+
+    if not await ensure_valid_token():
+        return "Error: Not authenticated."
+
+    # Fetch page HTML content (reuse existing tool logic)
+    content_html = await get_page_content(page_id)
+    if content_html.startswith("Error"):
+        return content_html
+
+    # Create cache directory
+    cache_dir = Path.home() / ".onenote_mcp_cache" / page_id
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find all Graph resource URLs embedded in img src / object data attributes
+    resource_pattern = re.compile(
+        r'https://graph\.microsoft\.com/v1\.0[^\s"\'<>]+/\$value',
+        re.IGNORECASE
+    )
+    resource_urls = list(dict.fromkeys(resource_pattern.findall(content_html)))
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    manifest = []
+
+    async with httpx.AsyncClient() as client:
+        for url in resource_urls:
+            try:
+                response = await client.get(url, headers=headers)
+                if response.status_code >= 400:
+                    logger.warning(f"Failed to fetch resource {url}: {response.status_code}")
+                    continue
+
+                content_type = response.headers.get("content-type", "application/octet-stream").split(";")[0]
+                ext = mimetypes.guess_extension(content_type) or ".bin"
+                # Use a hash of the URL as the filename to avoid collisions
+                import hashlib
+                name = hashlib.md5(url.encode()).hexdigest()[:12] + ext
+                file_path = cache_dir / name
+                file_path.write_bytes(response.content)
+
+                manifest.append({
+                    "url": url,
+                    "local_path": str(file_path),
+                    "mime_type": content_type,
+                    "size_bytes": len(response.content)
+                })
+                logger.info(f"Saved resource: {file_path}")
+
+            except Exception as e:
+                logger.warning(f"Error fetching resource {url}: {e}")
+
+    return json.dumps({
+        "page_id": page_id,
+        "cache_dir": str(cache_dir),
+        "resources_found": len(resource_urls),
+        "resources_saved": len(manifest),
+        "files": manifest
+    }, indent=2)
 
 @mcp.tool()
 async def clear_token_cache() -> str:
