@@ -33,6 +33,8 @@ GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 SCOPES = [
     "https://graph.microsoft.com/Notes.Read",
     "https://graph.microsoft.com/Notes.ReadWrite",
+    "https://graph.microsoft.com/Notes.Read.All",
+    "https://graph.microsoft.com/Notes.ReadWrite.All",
     "https://graph.microsoft.com/User.Read"
 ]
 
@@ -526,10 +528,68 @@ async def list_notebooks() -> str:
         logger.error(f"Error in list_notebooks: {str(e)}")
         return f"Error listing notebooks: {str(e)}"
 
+def _parse_sections(raw_list, group_name=None):
+    return [
+        {
+            "id": s.get("id"),
+            "name": s.get("displayName"),
+            "created": s.get("createdDateTime"),
+            "modified": s.get("lastModifiedDateTime"),
+            **({"group_name": group_name} if group_name else {})
+        }
+        for s in raw_list
+    ]
+
+def _parse_section_groups(raw_list):
+    return [
+        {
+            "id": g.get("id"),
+            "name": g.get("displayName"),
+            "created": g.get("createdDateTime"),
+            "modified": g.get("lastModifiedDateTime")
+        }
+        for g in raw_list
+    ]
+
+@mcp.tool()
+async def list_section_groups(notebook_id: str) -> str:
+    """
+    List section groups (folders) in a specific notebook.
+
+    Args:
+        notebook_id: ID of the notebook to list section groups from
+
+    Returns:
+        JSON string containing section group information
+    """
+    try:
+        groups = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sectionGroups")
+        return json.dumps(_parse_section_groups(groups.get("value", [])), indent=2)
+    except Exception as e:
+        return f"Error listing section groups: {str(e)}"
+
+@mcp.tool()
+async def list_sections_in_group(group_id: str) -> str:
+    """
+    List sections inside a section group.
+
+    Args:
+        group_id: ID of the section group
+
+    Returns:
+        JSON string containing section information
+    """
+    try:
+        sections = await make_graph_request(f"/me/onenote/sectionGroups/{group_id}/sections")
+        return json.dumps(_parse_sections(sections.get("value", [])), indent=2)
+    except Exception as e:
+        return f"Error listing sections in group: {str(e)}"
+
 @mcp.tool()
 async def list_sections(notebook_id: str) -> str:
     """
-    List sections in a specific notebook.
+    List all sections in a notebook, including sections inside section groups.
+    Results from section groups include a group_name field.
 
     Args:
         notebook_id: ID of the notebook to list sections from
@@ -537,32 +597,121 @@ async def list_sections(notebook_id: str) -> str:
     Returns:
         JSON string containing section information
     """
-    def parse_sections(raw_list):
-        return [
-            {
-                "id": s.get("id"),
-                "name": s.get("displayName"),
-                "created": s.get("createdDateTime"),
-                "modified": s.get("lastModifiedDateTime")
-            }
-            for s in raw_list
-        ]
+    all_sections = []
+
+    # Root-level sections
+    try:
+        resp = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sections")
+        all_sections.extend(_parse_sections(resp.get("value", [])))
+    except Exception:
+        pass
+
+    # Sections inside section groups
+    try:
+        groups_resp = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sectionGroups")
+        for group in groups_resp.get("value", []):
+            group_id = group.get("id")
+            group_name = group.get("displayName")
+            try:
+                sections_resp = await make_graph_request(f"/me/onenote/sectionGroups/{group_id}/sections")
+                all_sections.extend(_parse_sections(sections_resp.get("value", []), group_name=group_name))
+            except Exception:
+                pass
+
+            # One level of nested groups
+            try:
+                nested_resp = await make_graph_request(f"/me/onenote/sectionGroups/{group_id}/sectionGroups")
+                for nested_group in nested_resp.get("value", []):
+                    nested_id = nested_group.get("id")
+                    nested_name = f"{group_name} > {nested_group.get('displayName')}"
+                    try:
+                        nested_sections_resp = await make_graph_request(f"/me/onenote/sectionGroups/{nested_id}/sections")
+                        all_sections.extend(_parse_sections(nested_sections_resp.get("value", []), group_name=nested_name))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return json.dumps(all_sections, indent=2)
+
+@mcp.tool()
+async def get_notebook_structure(notebook_id: str) -> str:
+    """
+    Get the full structure of a notebook as a tree: root sections and section groups
+    with their sections, recursing one level into nested section groups.
+
+    Args:
+        notebook_id: ID of the notebook
+
+    Returns:
+        JSON string containing the full notebook tree
+    """
+    async def build_group_tree(group_id: str, group_name: str) -> dict:
+        sections = []
+        nested_groups = []
+
+        try:
+            resp = await make_graph_request(f"/me/onenote/sectionGroups/{group_id}/sections")
+            sections = _parse_sections(resp.get("value", []))
+        except Exception:
+            pass
+
+        try:
+            nested_resp = await make_graph_request(f"/me/onenote/sectionGroups/{group_id}/sectionGroups")
+            for ng in nested_resp.get("value", []):
+                ng_id = ng.get("id")
+                ng_sections = []
+                try:
+                    ng_sections_resp = await make_graph_request(f"/me/onenote/sectionGroups/{ng_id}/sections")
+                    ng_sections = _parse_sections(ng_sections_resp.get("value", []))
+                except Exception:
+                    pass
+                nested_groups.append({
+                    "id": ng_id,
+                    "name": ng.get("displayName"),
+                    "sections": ng_sections,
+                    "section_groups": []
+                })
+        except Exception:
+            pass
+
+        return {
+            "id": group_id,
+            "name": group_name,
+            "sections": sections,
+            "section_groups": nested_groups
+        }
 
     try:
-        sections = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sections")
-        return json.dumps(parse_sections(sections.get("value", [])), indent=2)
-    except Exception as personal_err:
-        # Fall back to SharePoint endpoint
-        site_id = await get_sharepoint_site_id()
-        if site_id:
-            try:
-                sections = await make_graph_request(
-                    f"/sites/{site_id}/onenote/notebooks/{notebook_id}/sections"
-                )
-                return json.dumps(parse_sections(sections.get("value", [])), indent=2)
-            except Exception as sp_err:
-                return f"Error listing sections (personal: {personal_err}; sharepoint: {sp_err})"
-        return f"Error listing sections: {personal_err}"
+        # Get notebook name
+        notebook_resp = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}")
+        notebook_name = notebook_resp.get("displayName", notebook_id)
+    except Exception:
+        notebook_name = notebook_id
+
+    root_sections = []
+    try:
+        resp = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sections")
+        root_sections = _parse_sections(resp.get("value", []))
+    except Exception:
+        pass
+
+    section_groups = []
+    try:
+        groups_resp = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sectionGroups")
+        for group in groups_resp.get("value", []):
+            section_groups.append(await build_group_tree(group.get("id"), group.get("displayName")))
+    except Exception as e:
+        return f"Error getting notebook structure: {str(e)}"
+
+    return json.dumps({
+        "notebook_id": notebook_id,
+        "notebook_name": notebook_name,
+        "root_sections": root_sections,
+        "section_groups": section_groups
+    }, indent=2)
 
 @mcp.tool()
 async def list_pages(section_id: str) -> str:
@@ -589,18 +738,28 @@ async def list_pages(section_id: str) -> str:
 
     try:
         pages = await make_graph_request(f"/me/onenote/sections/{section_id}/pages")
-        return json.dumps(parse_pages(pages.get("value", [])), indent=2)
+        result = parse_pages(pages.get("value", []))
+        if result:
+            return json.dumps(result, indent=2)
     except Exception as personal_err:
-        site_id = await get_sharepoint_site_id()
-        if site_id:
-            try:
-                pages = await make_graph_request(
-                    f"/sites/{site_id}/onenote/sections/{section_id}/pages"
-                )
-                return json.dumps(parse_pages(pages.get("value", [])), indent=2)
-            except Exception as sp_err:
+        pass
+    else:
+        personal_err = None
+
+    # Fall back to SharePoint endpoint (handles sections in OneDrive for Business notebooks)
+    site_id = await get_sharepoint_site_id()
+    if site_id:
+        try:
+            pages = await make_graph_request(
+                f"/sites/{site_id}/onenote/sections/{section_id}/pages"
+            )
+            return json.dumps(parse_pages(pages.get("value", [])), indent=2)
+        except Exception as sp_err:
+            if personal_err:
                 return f"Error listing pages (personal: {personal_err}; sharepoint: {sp_err})"
-        return f"Error listing pages: {personal_err}"
+            return f"Error listing pages from SharePoint: {sp_err}"
+
+    return json.dumps([], indent=2)
 
 @mcp.tool()
 async def get_page_content(page_id: str) -> str:
@@ -746,6 +905,20 @@ async def clear_token_cache() -> str:
             "status": "error",
             "error": str(e)
         }, indent=2)
+
+@mcp.tool()
+async def restart_server() -> str:
+    """
+    Restart the MCP server process. Use this to pick up code changes without
+    restarting Claude. The server will automatically reconnect.
+
+    Returns:
+        Status message (sent before exit)
+    """
+    import threading
+    # Delay exit slightly so the response can be sent back to the client first
+    threading.Timer(0.5, lambda: os._exit(0)).start()
+    return json.dumps({"status": "restarting", "message": "Server is restarting..."}, indent=2)
 
 @mcp.tool()
 async def create_notebook(name: str, description: str = None) -> str:
