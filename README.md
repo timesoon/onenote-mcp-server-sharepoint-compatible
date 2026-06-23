@@ -1,252 +1,144 @@
-# OneNote MCP Server
+# OneNote MCP Server — extended fork
 
-A complete, robust Model Context Protocol (MCP) server for Microsoft OneNote integration with Claude Desktop. Access your entire OneNote knowledge base through natural language queries.
+A Model Context Protocol server for Microsoft OneNote integration with Claude Desktop. This is an actively-maintained fork that adds pagination, nested folder (section group) support, OneDrive for Business / SharePoint compatibility, page-link surfacing, and several bug fixes on top of the upstream base.
 
-## 🎯 What This Does
+**Use this fork if you need any of:**
 
-Transform your OneNote notebooks into an AI-accessible knowledge base:
-- **List all your notebooks, sections, and pages**
-- **Read page content** for analysis and search
-- **Natural language queries** like "Show me my DevOps notes" or "Find pages about project planning"
-- **Secure OAuth authentication** with Microsoft Graph API
-- **Bulletproof error handling** with detailed debugging
+- Notebooks with more than ~100 pages in a section (upstream silently truncates)
+- SharePoint-backed notebooks (OneDrive for Business accounts)
+- Nested section group / folder hierarchies
+- Direct URLs (`web_url`, `client_url`) to pages, sections, and notebooks in tool output
+- Working `get_page_resources` (upstream throws `'FunctionTool' object is not callable`)
 
-## ✨ Why This Implementation
+## Lineage
 
-Unlike other OneNote MCP servers, this one:
-- ✅ **Actually works** - tested extensively with real OneNote data
-- ✅ **Complete functionality** - all core OneNote operations implemented
-- ✅ **Robust authentication** - two-step device flow that handles edge cases
-- ✅ **Production ready** - proper error handling and logging
-- ✅ **Easy setup** - detailed instructions for non-technical users
+```
+purpleslurple/onenote-mcp-server   <-- original base
+  └─ peterstahley/onenote-mcp-server-sharepoint-compatible   <-- adds SharePoint auth
+      └─ this fork   <-- adds pagination, section groups, URL surfacing, bug fixes
+```
 
-## 🚀 Quick Start
+Both upstream maintainers have open PRs from this fork ([upstream pagination fix](https://github.com/purpleslurple/onenote-mcp-server/pulls), [feature PR to peter](https://github.com/peterstahley/onenote-mcp-server-sharepoint-compatible/pulls)). If those merge you can switch back to upstream; until then, use this.
+
+## What's new vs upstream
+
+### Bug fixes
+- Pagination on every collection endpoint via new `make_graph_request_all` helper. Handles OneNote's known `@odata.nextLink` omission with a manual `$skip` fallback.
+- `get_page_resources` no longer throws `FunctionTool object is not callable`.
+- `list_pages` `personal_err` Python 3 scoping bug fixed.
+- `python-dotenv` import is now optional.
+
+### New tools
+- `list_section_groups(notebook_id)` — top-level folders in a notebook
+- `list_sections_in_group(group_id)` — sections directly inside a folder
+- `list_section_group_contents(group_id)` — sections + nested folders inside a folder
+- `list_all_sections(notebook_id, max_depth=10)` — flat list of every section across the entire notebook with breadcrumb `group_name` tags
+- `enumerate_notebook(notebook_id, include_pages=False, max_depth=10)` — recursive tree of the full notebook
+- `debug_list_pages(...)` — diagnostic tool for investigating pagination issues
+- `restart_server()` — reload server code without restarting Claude Desktop
+
+### URL surfacing
+Every notebook / section / page returned by `list_*` and `enumerate_notebook` now includes:
+- `web_url` — opens the item in OneNote on the web (SharePoint URL with `?wd=target(...)` deep-link)
+- `client_url` — `onenote:` scheme URL that deep-links into the OneNote desktop app
+
+## Quick start
 
 ### Prerequisites
-- Python 3.10+ 
-- [uv package manager](https://docs.astral.sh/uv/getting-started/installation/) (recommended) or pip
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended) or pip
 - Claude Desktop
 - Microsoft Azure account (free)
 
-### 1. Install uv (if you don't have it)
+### 1. Clone
+
 ```bash
-# macOS/Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# or with Homebrew
-brew install uv
-```
-
-### 2. Clone and Setup
-```bash
-git clone https://github.com/yourusername/onenote-mcp-server.git
-cd onenote-mcp-server
-
-# Create virtual environment and install dependencies
+git clone https://github.com/timesoon/onenote-mcp-server-sharepoint-compatible.git
+cd onenote-mcp-server-sharepoint-compatible
 uv sync
 ```
 
-### 3. Azure App Registration
-You need to create an Azure app to access OneNote. **Don't worry, it's free and takes 5 minutes:**
+### 2. Azure App Registration
 
-1. Go to [Azure Portal](https://portal.azure.com) (sign in with your Microsoft account)
-2. Navigate to **Azure Active Directory** → **App registrations** → **New registration**
-3. Fill out the form:
-   - **Name**: "OneNote MCP Server" (or whatever you like)
-   - **Supported account types**: "Accounts in any organizational directory and personal Microsoft accounts"
-   - **Redirect URI**: Select "Public client/native" and enter: `https://login.microsoftonline.com/common/oauth2/nativeclient`
-4. Click **Register**
-5. Copy the **Application (client) ID** - you'll need this!
+1. Go to [Azure Portal](https://portal.azure.com)
+2. **Azure Active Directory** → **App registrations** → **New registration**
+3. Name: anything; account type: "Accounts in any organizational directory and personal Microsoft accounts"; redirect URI: select "Public client/native" and enter `https://login.microsoftonline.com/common/oauth2/nativeclient`
+4. Register, copy the **Application (client) ID**
+5. **API permissions** → **Add a permission** → **Microsoft Graph** → **Delegated permissions** → add `Notes.Read`, `Notes.ReadWrite`, `Notes.Read.All`, `Notes.ReadWrite.All`, `User.Read`
+6. Click **Grant admin consent**
 
-### 4. Add Permissions
-Still in your Azure app:
-1. Go to **API permissions** → **Add a permission**
-2. Select **Microsoft Graph** → **Delegated permissions**
-3. Add these permissions:
-   - `Notes.Read` - Read OneNote notebooks
-   - `Notes.ReadWrite` - Create/modify OneNote content (optional but recommended)
-   - `User.Read` - Read user profile
-4. Click **Grant admin consent** (the button at the top)
+### 3. Configure Claude Desktop
 
-### 5. Configure Claude Desktop
-Edit your Claude Desktop config file:
+Edit `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Windows**: `%APPDATA%\\Claude\\claude_desktop_config.json`
-
-Add this configuration (replace `/ABSOLUTE/PATH/TO/PARENT/FOLDER/weather` with your actual path):
-
-**Basic configuration:**
 ```json
 {
   "mcpServers": {
     "onenote": {
       "command": "uv",
       "args": [
-        "--directory", "/FULL/PATH/TO/onenote-mcp-server",
+        "--directory", "/FULL/PATH/TO/onenote-mcp-server-sharepoint-compatible",
         "run", "python", "onenote_mcp_server.py"
       ],
       "env": {
-        "AZURE_CLIENT_ID": "your-azure-client-id-here"
+        "AZURE_CLIENT_ID": "your-client-id-here"
       }
     }
   }
 }
 ```
 
-**With explicit token caching control:**
+Restart Claude Desktop. You should see OneNote tools in the 🔨 menu.
+
+### 4. Authenticate
+
+In Claude Desktop, say `Start OneNote authentication`. Follow the device-code flow. Then `Complete OneNote authentication`.
+
+## SharePoint / OneDrive for Business
+
+If your OneNote notebooks live on SharePoint (typical for OneDrive for Business / Microsoft 365 work accounts), set these env vars in addition to `AZURE_CLIENT_ID`:
+
 ```json
-{
-  "mcpServers": {
-    "onenote": {
-      "command": "uv",
-      "args": [
-        "--directory", "/FULL/PATH/TO/onenote-mcp-server",
-        "run", "python", "onenote_mcp_server.py"
-      ],
-      "env": {
-        "AZURE_CLIENT_ID": "your-azure-client-id-here",
-        "ONENOTE_CACHE_TOKENS": "true"
-      }
-    }
-  }
+"env": {
+    "AZURE_CLIENT_ID": "your-client-id-here",
+    "AZURE_TENANT_ID": "your-tenant-id-here",
+    "SHAREPOINT_HOST": "yourcompany-my.sharepoint.com",
+    "SHAREPOINT_USER_PATH": "/personal/your_user_yourcompany_com"
 }
 ```
 
-Replace `/FULL/PATH/TO/onenote-mcp-server` with the actual path to this project.
+Without these, the server falls back to personal-only OneNote — which works for `live.com` / personal Microsoft accounts but returns 404s for work accounts.
 
-### 6. Restart Claude Desktop
-Completely quit and restart Claude Desktop. You should see OneNote tools in the 🔨 menu.
+## Environment variables
 
-## 🔐 First Time Authentication
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `AZURE_CLIENT_ID` | Yes | Azure App Registration client ID |
+| `AZURE_TENANT_ID` | No (default: `common`) | Set to your tenant ID for SharePoint |
+| `SHAREPOINT_HOST` | No | SharePoint host, e.g. `contoso-my.sharepoint.com` |
+| `SHAREPOINT_USER_PATH` | No | Path to your personal site, e.g. `/personal/alice_contoso_com` |
+| `ONENOTE_CACHE_TOKENS` | No (default: `true`) | Set to `false` to disable on-disk token caching |
 
-1. In Claude Desktop, say: **"Start OneNote authentication"**
-2. Claude will give you a URL and code
-3. Visit the URL in your browser, enter the code, and sign in
-4. **Browser compatibility**: 
-   - ✅ **Firefox** (tested with 139.0.4) - works perfectly
-   - ❌ **Safari** - may have issues with Microsoft OAuth redirect
-   - ✅ **Chrome/Edge** - should work (Microsoft's browsers)
-5. Come back to Claude and say: **"Complete OneNote authentication"**
-6. You're ready to go!
+## Recursion depth
 
-### Token Persistence
+`enumerate_notebook` and `list_all_sections` take a `max_depth` parameter (default `10`). OneNote's section groups form a tree (no cycles), so this is a soft safety valve. If hit, a warning is logged and deeper branches are omitted — no error. Real notebooks rarely go deeper than 3–4 levels.
 
-By default, authentication tokens are cached securely on your local machine so you only need to authenticate once every few weeks/months. 
+## Troubleshooting
 
-**To disable token caching** (for security-sensitive environments):
-```json
-{
-  "mcpServers": {
-    "onenote": {
-      "command": "uv",
-      "args": [
-        "--directory", "/FULL/PATH/TO/onenote-mcp-server",
-        "run", "python", "onenote_mcp_server.py"
-      ],
-      "env": {
-        "AZURE_CLIENT_ID": "YOUR_CLIENT_ID_HERE",
-        "ONENOTE_CACHE_TOKENS": "false"
-      }
-    }
-  }
-}
-```
+**"No tools available" in Claude Desktop** — confirm you restarted Claude Desktop after editing the config, and that the path in the config is absolute (no `~`). Run `uv --version` to confirm uv is installed.
 
-**Token caching options:**
-- `ONENOTE_CACHE_TOKENS=true` (default) - Tokens persist across sessions
-- `ONENOTE_CACHE_TOKENS=false` - Authenticate every session (more secure)
+**Auth fails** — Firefox / Chrome / Edge work; Safari has known issues with Microsoft's OAuth redirect. Use `Clear OneNote token cache` if you need to reset.
 
-## 📖 Usage Examples
+**Empty results from work accounts** — set `SHAREPOINT_HOST` and `SHAREPOINT_USER_PATH` (see above).
 
-Once authenticated, try these commands in Claude Desktop:
+**Pagination still truncating** — call `debug_list_pages` on the offending section with `count=true` to see actual record counts and whether `@odata.nextLink` was returned. Send the output if filing an issue.
 
-```
-List my OneNote notebooks
-Show me sections in my Work notebook  
-What pages are in my Ideas section?
-Read the content of my "Project Plan" page
-```
+## License
 
-## 🛠 Troubleshooting
+MIT (inherited from upstream). See LICENSE.
 
-### "No tools available" in Claude Desktop
-- Make sure you restarted Claude Desktop after config changes
-- Check that the path in your config is correct (use full absolute path)
-- Verify uv is installed: `uv --version`
+## Acknowledgments
 
-### Authentication issues
-- **Safari OAuth problems**: Safari may not handle Microsoft's OAuth redirect properly - use Firefox or Chrome instead
-- **"nativeclient" prompts**: Normal Microsoft OAuth behavior, but if it blocks authentication, try a different browser
-- **Authentication expired**: Use "Check OneNote authentication status" to see token expiry
-- **Clear cached tokens**: Use "Clear OneNote token cache" if you need to reset authentication
-- **Recommended browsers**: Firefox (confirmed working), Chrome, or Edge for best compatibility
-
-### "Command not found" errors
-- Make sure uv is in your PATH
-- Alternative: replace `"uv"` with `"python"` in the config and use the full path to your Python interpreter
-
-### Permission denied errors
-- Check the file permissions in your project directory
-- Make sure Claude Desktop can read the files
-
-## 🏗 Development
-
-### Project Structure
-```
-onenote-mcp-server/
-├── onenote_mcp_server.py      # Main server implementation
-├── pyproject.toml             # Dependencies and metadata  
-├── README.md                  # This file
-├── LICENSE                    # MIT License
-└── .gitignore                 # Git ignore rules
-```
-
-### Key Features
-- **Two-step authentication**: Handles device code flow properly
-- **Complete Graph API integration**: All OneNote operations supported
-- **Robust error handling**: Detailed logging and graceful failures
-- **FastMCP framework**: Clean, maintainable code structure
-- **Environment variable configuration**: Secure credential handling
-
-### Adding New Features
-The server is built with FastMCP, making it easy to add new tools:
-
-```python
-@mcp.tool()
-async def your_new_tool(param: str) -> str:
-    """Description of what your tool does."""
-    # Your implementation here
-    return result
-```
-
-## 🤝 Contributing
-
-Contributions welcome! Please:
-1. Fork the repo
-2. Create a feature branch
-3. Add tests for new functionality  
-4. Submit a pull request
-
-## 📄 License
-
-MIT License - see LICENSE file for details.
-
-## 🙏 Acknowledgments
-
-- Built with [FastMCP](https://github.com/jlowin/fastmcp) framework
-- Uses Microsoft Graph API for OneNote access
-- Inspired by the amazing potential of AI + personal knowledge bases
-
-## ⚠️ Important Notes
-
-- This server only reads/writes data you already have access to
-- Your Azure app credentials stay on your machine
-- All authentication happens directly between you and Microsoft
-- No data is sent to third parties
-
----
-
-**Built with ❤️ for the Claude + OneNote community**
-
-*Turn your OneNote into an AI-accessible knowledge base!*
+- [purpleslurple](https://github.com/purpleslurple) for the original implementation
+- [peterstahley](https://github.com/peterstahley) for the SharePoint auth work
+- Built on [FastMCP](https://github.com/jlowin/fastmcp) and the Microsoft Graph API
