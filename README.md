@@ -250,3 +250,59 @@ MIT License - see LICENSE file for details.
 **Built with ❤️ for the Claude + OneNote community**
 
 *Turn your OneNote into an AI-accessible knowledge base!*
+
+
+---
+
+# README additions
+
+These sections should be added/merged into peter's existing `README.md`. They do not replace it — the existing setup instructions, Azure app registration steps, and licence still apply.
+
+---
+
+## What this release adds
+
+### Full pagination
+
+Every OneNote collection endpoint is now paginated. This fixes silent truncation at ~100 records that affected `list_pages` in particular (OneNote's API does not always emit `@odata.nextLink` for the pages endpoint). Internally this is handled by `make_graph_request_all` which uses `@odata.nextLink` when available and falls back to manual `$skip` pagination when it isn't.
+
+### Section group (folder) support
+
+OneNote notebooks can contain nested folder hierarchies via section groups. Four new tools expose this structure:
+
+| Tool | Description |
+|------|-------------|
+| `list_section_groups(notebook_id)` | Top-level folders in a notebook |
+| `list_sections_in_group(group_id)` | Sections directly inside a folder |
+| `list_section_group_contents(group_id)` | Sections + nested subfolders inside a folder (one level) |
+| `enumerate_notebook(notebook_id, include_pages, max_depth)` | Full recursive tree of the notebook |
+| `list_all_sections(notebook_id, max_depth)` | Flat list of every section with breadcrumb `group_name` tags |
+
+`list_sections` returns root-level sections only, matching the upstream base and composing with the tools above.
+
+### New diagnostic tool
+
+`debug_list_pages(section_id, top, orderby, count)` surfaces pagination behavior for a section — useful for investigating suspected truncation without editing source.
+
+### Optional python-dotenv
+
+The server now runs whether or not `python-dotenv` is installed. If you previously set `AZURE_CLIENT_ID` etc. via Claude Desktop's config, nothing changes. If you were using a `.env` file, install `python-dotenv` as before.
+
+---
+
+## Environment variables
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `AZURE_CLIENT_ID` | Yes | Azure App Registration client ID |
+| `AZURE_TENANT_ID` | No (default: `common`) | Azure tenant — set to your tenant ID for SharePoint |
+| `SHAREPOINT_HOST` | No | SharePoint host, e.g. `contoso-my.sharepoint.com`. Required for SharePoint-backed notebooks. |
+| `SHAREPOINT_USER_PATH` | No | Path to your personal site, e.g. `/personal/alice_contoso_com`. Required with `SHAREPOINT_HOST`. |
+| `ONENOTE_CACHE_TOKENS` | No (default: `true`) | Set to `false` to disable on-disk token caching |
+
+---
+
+## Recursion depth
+
+`enumerate_notebook` and `list_all_sections` take a `max_depth` parameter (default `10`). OneNote's section groups form a tree (no cycles), so this is a soft safety valve rather than a correctness requirement. If it's hit, a warning is logged and deeper branches are omitted — you won't get an error. Real notebooks almost never go deeper than 3–4 levels.
+

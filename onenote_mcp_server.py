@@ -3,7 +3,23 @@
 OneNote MCP Server
 
 A Model Context Protocol server for Microsoft OneNote integration.
-This allows Claude Desktop to read and interact with OneNote notebooks.
+Supports personal OneDrive notebooks and SharePoint / OneDrive-for-Business
+notebooks. Handles OneNote's pagination quirks (nextLink omission, silent
+100-record truncation) and exposes section-group / nested-folder tools.
+
+Lineage:
+    * Base:   purpleslurple/onenote-mcp-server
+    * Fork:   peterstahley/onenote-mcp-server-sharepoint-compatible
+              (adds SharePoint support, get_page_resources, restart_server)
+    * This release adds:
+        - Dual-strategy pagination (nextLink + manual $skip fallback)
+          applied to every collection endpoint
+        - list_section_groups / list_section_group_contents tools
+        - enumerate_notebook tool with configurable recursion depth
+        - list_all_sections flat view (with group_name tags)
+        - debug_list_pages diagnostic tool
+        - list_pages personal_err scope-bug fix
+        - Optional python-dotenv (no hard dependency)
 """
 
 import os
@@ -13,13 +29,17 @@ import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import time
-from dotenv import load_dotenv
 from msal import ConfidentialClientApplication, PublicClientApplication
 import httpx
 from fastmcp import FastMCP
 
-# Load .env file if present (env vars set by Claude Desktop take precedence)
-load_dotenv()
+# Optional .env support. The server works fine without python-dotenv — env
+# vars set by Claude Desktop (or the shell) take precedence either way.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +67,10 @@ SHAREPOINT_USER_PATH = os.getenv("SHAREPOINT_USER_PATH", "")
 TOKEN_CACHE_ENABLED = os.getenv("ONENOTE_CACHE_TOKENS", "true").lower() in ("true", "1", "yes")
 TOKEN_CACHE_FILE = Path.home() / ".onenote_mcp_tokens.json"
 
+# Safe-default recursion depth for enumerate_notebook. No hard cap — set
+# by caller. This is a soft warning threshold.
+DEFAULT_ENUM_DEPTH = 10
+
 # Global variables for authentication
 access_token: Optional[str] = None
 refresh_token: Optional[str] = None
@@ -63,63 +87,55 @@ def get_client_id() -> str:
 def save_tokens(access_tok: str, refresh_tok: str = None, expires_in: int = 3600) -> None:
     """Save tokens to disk for persistence across sessions."""
     global access_token, refresh_token, token_expires_at
-    
+
     access_token = access_tok
     if refresh_tok:
         refresh_token = refresh_tok
     token_expires_at = time.time() + expires_in - 300  # 5 min buffer
-    
-    # Only save to disk if caching is enabled
+
     if not TOKEN_CACHE_ENABLED:
         logger.info("Token caching disabled - tokens will not persist across sessions")
         return
-    
+
     try:
         token_data = {
             "access_token": access_token,
             "refresh_token": refresh_token,
             "expires_at": token_expires_at
         }
-        
         with open(TOKEN_CACHE_FILE, 'w') as f:
             json.dump(token_data, f)
-        
-        # Set secure permissions (user read/write only)
         TOKEN_CACHE_FILE.chmod(0o600)
         logger.info(f"Tokens saved to {TOKEN_CACHE_FILE}")
-        
     except Exception as e:
         logger.warning(f"Failed to save tokens: {e}")
 
 def load_tokens() -> bool:
     """Load tokens from disk. Returns True if valid tokens loaded."""
     global access_token, refresh_token, token_expires_at
-    
-    # Don't load tokens if caching is disabled
+
     if not TOKEN_CACHE_ENABLED:
         logger.info("Token caching disabled - will not load cached tokens")
         return False
-    
+
     try:
         if not TOKEN_CACHE_FILE.exists():
             logger.info(f"No token cache file found at {TOKEN_CACHE_FILE}")
             return False
-            
+
         with open(TOKEN_CACHE_FILE, 'r') as f:
             token_data = json.load(f)
-        
+
         access_token = token_data.get("access_token")
         refresh_token = token_data.get("refresh_token")
         token_expires_at = token_data.get("expires_at")
-        
-        # Check if token is still valid
+
         if token_expires_at and time.time() < token_expires_at:
             logger.info(f"Valid tokens loaded from {TOKEN_CACHE_FILE}")
             return True
         else:
             logger.info("Cached tokens expired")
             return False
-            
     except Exception as e:
         logger.warning(f"Failed to load tokens: {e}")
         return False
@@ -127,18 +143,14 @@ def load_tokens() -> bool:
 async def refresh_access_token() -> bool:
     """Try to refresh the access token using the refresh token."""
     global access_token, msal_app
-    
+
     if not refresh_token or not msal_app:
         return False
-    
+
     try:
-        # Try to get accounts from MSAL cache
         accounts = msal_app.get_accounts()
-        
         if accounts:
-            # Try silent acquisition first
             result = msal_app.acquire_token_silent(SCOPES, account=accounts[0])
-            
             if result and "access_token" in result:
                 save_tokens(
                     result["access_token"],
@@ -147,11 +159,9 @@ async def refresh_access_token() -> bool:
                 )
                 logger.info("Token refreshed successfully via MSAL silent acquisition")
                 return True
-        
-        # MSAL silent acquisition failed - try manual refresh with cached refresh token
+
         logger.info("MSAL silent acquisition failed, trying manual refresh with cached token")
         return await manual_token_refresh()
-        
     except Exception as e:
         logger.warning(f"Token refresh error: {e}")
         return False
@@ -159,56 +169,45 @@ async def refresh_access_token() -> bool:
 async def manual_token_refresh() -> bool:
     """Manually refresh access token using cached refresh token."""
     global access_token, refresh_token
-    
+
     if not refresh_token:
         logger.info("No refresh token available for manual refresh")
         return False
-    
+
     try:
         client_id = get_client_id()
-        
-        # Microsoft token endpoint
         token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-        
-        # Prepare refresh token request
         data = {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": client_id,
-            "scope": " ".join(SCOPES + ["offline_access"])  # Include offline_access for refresh requests
+            "scope": " ".join(SCOPES + ["offline_access"])
         }
-        
-        # Make the refresh request
+
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 token_url,
                 data=data,
                 headers={"Content-Type": "application/x-www-form-urlencoded"}
             )
-            
             if response.status_code == 200:
                 token_data = response.json()
-                
-                # Save the new tokens
                 save_tokens(
                     token_data["access_token"],
-                    token_data.get("refresh_token", refresh_token),  # Use new refresh token if provided
+                    token_data.get("refresh_token", refresh_token),
                     token_data.get("expires_in", 3600)
                 )
-                
                 logger.info("Token refreshed successfully via manual refresh")
                 return True
             else:
                 logger.warning(f"Manual token refresh failed: {response.status_code} - {response.text}")
                 return False
-                
     except Exception as e:
         logger.warning(f"Manual token refresh error: {e}")
         return False
 
 def init_msal_app(client_id: str) -> PublicClientApplication:
     """Initialize MSAL application for authentication."""
-    # Create a simple in-memory cache for MSAL
     return PublicClientApplication(
         client_id=client_id,
         authority=f"https://login.microsoftonline.com/{TENANT_ID}"
@@ -217,23 +216,19 @@ def init_msal_app(client_id: str) -> PublicClientApplication:
 async def ensure_valid_token() -> bool:
     """Ensure we have a valid access token, refreshing if needed."""
     global access_token, msal_app
-    
-    # First, try loading cached tokens
+
     if not access_token:
         load_tokens()
-    
-    # Check if current token is still valid
+
     if access_token and token_expires_at and time.time() < token_expires_at:
         return True
-    
-    # Try to refresh the token
+
     if not msal_app:
         msal_app = init_msal_app(get_client_id())
-    
+
     if await refresh_access_token():
         return True
-    
-    # No valid token available
+
     access_token = None
     return False
 
@@ -244,29 +239,26 @@ current_flow = None
 async def start_authentication() -> str:
     """
     Start the full authentication process.
-    
+
     Returns:
         Authentication instructions with device code
     """
     global access_token, msal_app, current_flow
-    
+
     try:
         client_id = get_client_id()
         logger.info(f"Starting authentication with client_id: {client_id[:8]}...")
-        
-        # Create MSAL app if not exists
+
         if not msal_app:
             msal_app = init_msal_app(client_id)
-        
-        # Start device code flow
+
         logger.info("Initiating device flow for authentication...")
         flow = msal_app.initiate_device_flow(scopes=SCOPES)
-        
+
         if "user_code" not in flow:
             error_msg = flow.get('error_description', 'Unknown error in device flow')
             raise Exception(f"Failed to create device flow: {error_msg}")
-        
-        # Return the authentication instructions
+
         result = {
             "status": "authentication_required",
             "instructions": f"Go to {flow['verification_uri']} and enter code: {flow['user_code']}",
@@ -275,58 +267,47 @@ async def start_authentication() -> str:
             "expires_in": flow.get('expires_in', 900),
             "message": "Please complete authentication, then call 'complete_authentication'"
         }
-        
-        # Store the flow for completion
         current_flow = flow
-        
         return json.dumps(result, indent=2)
-        
+
     except Exception as e:
         logger.error(f"Start authentication error: {str(e)}")
-        return json.dumps({
-            "status": "error",
-            "error": str(e)
-        }, indent=2)
+        return json.dumps({"status": "error", "error": str(e)}, indent=2)
 
 @mcp.tool()
 async def complete_authentication() -> str:
     """
     Complete the authentication process after user enters device code.
-    
+
     Returns:
         Authentication status and user info
     """
     global access_token, msal_app, current_flow
-    
+
     try:
         if not current_flow:
             return json.dumps({
                 "status": "error",
                 "error": "No authentication flow in progress. Call 'start_authentication' first."
             }, indent=2)
-        
+
         if not msal_app:
             return json.dumps({
-                "status": "error", 
+                "status": "error",
                 "error": "MSAL app not initialized"
             }, indent=2)
-        
+
         logger.info("Completing device flow authentication...")
-        
-        # Complete the flow
         result = msal_app.acquire_token_by_device_flow(current_flow)
-        
+
         if "access_token" in result:
-            # Save tokens for future use
             save_tokens(
                 result["access_token"],
                 result.get("refresh_token"),
                 result.get("expires_in", 3600)
             )
-            
             logger.info("Authentication successful and tokens cached!")
-            
-            # Test the token with a basic Graph API call
+
             try:
                 user_info = await make_graph_request("/me")
                 return json.dumps({
@@ -335,7 +316,6 @@ async def complete_authentication() -> str:
                     "user": user_info.get("displayName", "Unknown"),
                     "email": user_info.get("mail") or user_info.get("userPrincipalName", "Unknown")
                 }, indent=2)
-                        
             except Exception as graph_error:
                 return json.dumps({
                     "status": "partial_success",
@@ -348,34 +328,30 @@ async def complete_authentication() -> str:
                 "status": "error",
                 "error": f"Authentication failed: {error_desc}"
             }, indent=2)
-            
+
     except Exception as e:
         logger.error(f"Complete authentication error: {str(e)}")
-        return json.dumps({
-            "status": "error",
-            "error": str(e)
-        }, indent=2)
+        return json.dumps({"status": "error", "error": str(e)}, indent=2)
     finally:
-        # Clear the flow
         current_flow = None
 
 @mcp.tool()
 async def check_authentication() -> str:
     """
     Check current authentication status and token validity.
-    
+
     Returns:
         Authentication status information
     """
     try:
         cache_status = "enabled" if TOKEN_CACHE_ENABLED else "disabled"
         cache_file_exists = TOKEN_CACHE_FILE.exists() if TOKEN_CACHE_ENABLED else False
-        
+
         if await ensure_valid_token():
             try:
                 user_info = await make_graph_request("/me")
                 time_until_expiry = int(token_expires_at - time.time()) if token_expires_at else 0
-                
+
                 return json.dumps({
                     "status": "authenticated",
                     "user": user_info.get("displayName", "Unknown"),
@@ -386,7 +362,6 @@ async def check_authentication() -> str:
                     "cache_file_exists": cache_file_exists,
                     "cache_file_path": str(TOKEN_CACHE_FILE) if TOKEN_CACHE_ENABLED else "N/A"
                 }, indent=2)
-                
             except Exception as graph_error:
                 return json.dumps({
                     "status": "token_invalid",
@@ -401,7 +376,7 @@ async def check_authentication() -> str:
                 "token_caching": cache_status,
                 "cache_file_exists": cache_file_exists
             }, indent=2)
-            
+
     except Exception as e:
         return json.dumps({
             "status": "error",
@@ -409,9 +384,12 @@ async def check_authentication() -> str:
             "token_caching": "unknown"
         }, indent=2)
 
+# -----------------------------------------------------------------------------
+# Graph API helpers
+# -----------------------------------------------------------------------------
+
 async def make_graph_request(endpoint: str, method: str = "GET", data: Dict = None) -> Dict:
-    """Make a request to Microsoft Graph API."""
-    # Ensure we have a valid token before making the request
+    """Make a single request to Microsoft Graph API."""
     if not await ensure_valid_token():
         raise Exception("Not authenticated. Please call 'start_authentication' and 'complete_authentication' first.")
 
@@ -419,7 +397,6 @@ async def make_graph_request(endpoint: str, method: str = "GET", data: Dict = No
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
-
     url = f"{GRAPH_BASE_URL}{endpoint}"
 
     async with httpx.AsyncClient() as client:
@@ -436,6 +413,57 @@ async def make_graph_request(endpoint: str, method: str = "GET", data: Dict = No
         raise Exception(f"Graph API error: {response.status_code} - {response.text}")
 
     return response.json()
+
+async def make_graph_request_all(endpoint: str) -> list:
+    """Make a paginated GET request to Microsoft Graph API.
+
+    Handles two pagination strategies:
+    1. Follow @odata.nextLink if the API provides one
+    2. Fall back to manual $skip pagination if nextLink is missing
+       (OneNote pages API silently truncates at 100 without nextLink)
+    """
+    if not await ensure_valid_token():
+        raise Exception("Not authenticated. Please call 'start_authentication' and 'complete_authentication' first.")
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    results = []
+    url = f"{GRAPH_BASE_URL}{endpoint}"
+    sep = "&" if "?" in endpoint else "?"
+    if "$top=" not in endpoint:
+        url += f"{sep}$top=100"
+
+    async with httpx.AsyncClient() as client:
+        while url:
+            response = await client.get(url, headers=headers)
+            if response.status_code >= 400:
+                raise Exception(f"Graph API error: {response.status_code} - {response.text}")
+            data = response.json()
+            batch = data.get("value", [])
+            results.extend(batch)
+
+            # Strategy 1: follow nextLink if provided
+            next_link = data.get("@odata.nextLink")
+            if next_link:
+                url = next_link
+                continue
+
+            # Strategy 2: manual $skip if we got a full page but no nextLink
+            # (OneNote pages API is known to omit nextLink)
+            if len(batch) > 0 and len(batch) >= 100:
+                base = f"{GRAPH_BASE_URL}{endpoint}"
+                skip_sep = "&" if "?" in endpoint else "?"
+                if "$top=" not in endpoint:
+                    base += f"{skip_sep}$top=100"
+                    skip_sep = "&"
+                url = f"{base}{skip_sep}$skip={len(results)}"
+            else:
+                url = None
+
+    return results
 
 async def make_graph_request_binary(endpoint: str) -> bytes:
     """Make a Graph API request that returns binary content (images, files)."""
@@ -476,10 +504,48 @@ async def get_sharepoint_site_id() -> Optional[str]:
         logger.warning(f"Could not resolve SharePoint site ID: {e}")
         return None
 
+# -----------------------------------------------------------------------------
+# Notebook / section / page tools
+# -----------------------------------------------------------------------------
+
+def _parse_sections(raw_list, group_name=None):
+    out = []
+    for s in raw_list:
+        links = s.get("links") or {}
+        entry = {
+            "id": s.get("id"),
+            "name": s.get("displayName"),
+            "created": s.get("createdDateTime"),
+            "modified": s.get("lastModifiedDateTime"),
+            "web_url": (links.get("oneNoteWebUrl") or {}).get("href"),
+            "client_url": (links.get("oneNoteClientUrl") or {}).get("href"),
+        }
+        if group_name:
+            entry["group_name"] = group_name
+        out.append(entry)
+    return out
+
+def _parse_section_groups(raw_list):
+    out = []
+    for g in raw_list:
+        links = g.get("links") or {}
+        out.append({
+            "id": g.get("id"),
+            "name": g.get("displayName"),
+            "created": g.get("createdDateTime"),
+            "modified": g.get("lastModifiedDateTime"),
+            "sections_url": g.get("sectionsUrl"),
+            "section_groups_url": g.get("sectionGroupsUrl"),
+            "web_url": (links.get("oneNoteWebUrl") or {}).get("href"),
+            "client_url": (links.get("oneNoteClientUrl") or {}).get("href"),
+        })
+    return out
+
 @mcp.tool()
 async def list_notebooks() -> str:
     """
     List all OneNote notebooks, including SharePoint-backed notebooks.
+    Paginated — returns every notebook regardless of count.
 
     Returns:
         JSON string containing notebook information
@@ -493,18 +559,21 @@ async def list_notebooks() -> str:
                 nb_id = notebook.get("id")
                 if nb_id and nb_id not in seen_ids:
                     seen_ids.add(nb_id)
+                    links = notebook.get("links") or {}
                     result.append({
                         "id": nb_id,
                         "name": notebook.get("displayName"),
                         "created": notebook.get("createdDateTime"),
-                        "modified": notebook.get("lastModifiedDateTime")
+                        "modified": notebook.get("lastModifiedDateTime"),
+                        "web_url": (links.get("oneNoteWebUrl") or {}).get("href"),
+                        "client_url": (links.get("oneNoteClientUrl") or {}).get("href"),
                     })
 
         # Personal OneDrive notebooks
         logger.info("Fetching personal notebooks from /me/onenote/notebooks")
         try:
-            personal = await make_graph_request("/me/onenote/notebooks")
-            add_notebooks(personal.get("value", []))
+            personal_list = await make_graph_request_all("/me/onenote/notebooks")
+            add_notebooks(personal_list)
             logger.info(f"Found {len(result)} personal notebooks")
         except Exception as e:
             logger.warning(f"Could not fetch personal notebooks: {e}")
@@ -514,9 +583,9 @@ async def list_notebooks() -> str:
         if site_id:
             logger.info(f"Fetching SharePoint notebooks from /sites/{site_id}/onenote/notebooks")
             try:
-                sp_notebooks = await make_graph_request(f"/sites/{site_id}/onenote/notebooks")
+                sp_list = await make_graph_request_all(f"/sites/{site_id}/onenote/notebooks")
                 before = len(result)
-                add_notebooks(sp_notebooks.get("value", []))
+                add_notebooks(sp_list)
                 logger.info(f"Found {len(result) - before} additional SharePoint notebooks")
             except Exception as e:
                 logger.warning(f"Could not fetch SharePoint notebooks: {e}")
@@ -528,50 +597,121 @@ async def list_notebooks() -> str:
         logger.error(f"Error in list_notebooks: {str(e)}")
         return f"Error listing notebooks: {str(e)}"
 
-def _parse_sections(raw_list, group_name=None):
-    return [
-        {
-            "id": s.get("id"),
-            "name": s.get("displayName"),
-            "created": s.get("createdDateTime"),
-            "modified": s.get("lastModifiedDateTime"),
-            **({"group_name": group_name} if group_name else {})
-        }
-        for s in raw_list
-    ]
+@mcp.tool()
+async def list_sections(notebook_id: str) -> str:
+    """
+    List root-level sections in a specific notebook (does NOT recurse into
+    section groups). For a flat list of every section including those in
+    nested folders, use list_all_sections. For the full tree, use
+    enumerate_notebook.
 
-def _parse_section_groups(raw_list):
-    return [
-        {
-            "id": g.get("id"),
-            "name": g.get("displayName"),
-            "created": g.get("createdDateTime"),
-            "modified": g.get("lastModifiedDateTime")
-        }
-        for g in raw_list
-    ]
+    Args:
+        notebook_id: ID of the notebook to list sections from
+
+    Returns:
+        JSON string containing section information
+    """
+    try:
+        section_list = await make_graph_request_all(
+            f"/me/onenote/notebooks/{notebook_id}/sections"
+        )
+        return json.dumps(_parse_sections(section_list), indent=2)
+    except Exception as e:
+        return f"Error listing sections: {str(e)}"
+
+@mcp.tool()
+async def list_all_sections(notebook_id: str, max_depth: int = DEFAULT_ENUM_DEPTH) -> str:
+    """
+    List every section in a notebook as a flat list, including sections inside
+    nested section groups. Each result tagged with a 'group_name' field
+    (breadcrumbs like 'Engineering > Q1 > Retros') when inside a group.
+
+    Args:
+        notebook_id: ID of the notebook
+        max_depth: Soft recursion limit for nested section groups (default 10).
+                   Logs a warning if hit but does not error.
+
+    Returns:
+        JSON array of sections with optional group_name breadcrumb
+    """
+    all_sections: List[Dict] = []
+
+    async def _walk_group(group_id: str, breadcrumb: str, depth: int) -> None:
+        if depth > max_depth:
+            logger.warning(
+                f"list_all_sections: max_depth={max_depth} reached at '{breadcrumb}' — "
+                f"deeper sections will be omitted"
+            )
+            return
+        try:
+            sections_in_group = await make_graph_request_all(
+                f"/me/onenote/sectionGroups/{group_id}/sections"
+            )
+            all_sections.extend(_parse_sections(sections_in_group, group_name=breadcrumb))
+        except Exception as e:
+            logger.warning(f"Could not fetch sections in group '{breadcrumb}': {e}")
+
+        try:
+            nested_groups = await make_graph_request_all(
+                f"/me/onenote/sectionGroups/{group_id}/sectionGroups"
+            )
+            for ng in nested_groups:
+                ng_name = ng.get("displayName", "?")
+                ng_crumb = f"{breadcrumb} > {ng_name}"
+                await _walk_group(ng.get("id"), ng_crumb, depth + 1)
+        except Exception as e:
+            logger.warning(f"Could not fetch nested groups of '{breadcrumb}': {e}")
+
+    try:
+        # Root-level sections
+        try:
+            root_sections = await make_graph_request_all(
+                f"/me/onenote/notebooks/{notebook_id}/sections"
+            )
+            all_sections.extend(_parse_sections(root_sections))
+        except Exception as e:
+            logger.warning(f"Could not fetch root sections: {e}")
+
+        # Top-level section groups
+        try:
+            root_groups = await make_graph_request_all(
+                f"/me/onenote/notebooks/{notebook_id}/sectionGroups"
+            )
+            for group in root_groups:
+                await _walk_group(group.get("id"), group.get("displayName", "?"), depth=1)
+        except Exception as e:
+            logger.warning(f"Could not fetch top-level section groups: {e}")
+
+        return json.dumps(all_sections, indent=2)
+
+    except Exception as e:
+        return f"Error listing all sections: {str(e)}"
 
 @mcp.tool()
 async def list_section_groups(notebook_id: str) -> str:
     """
-    List section groups (folders) in a specific notebook.
+    List top-level section groups (folders) in a specific notebook.
+    Use list_section_group_contents to descend into a group.
 
     Args:
-        notebook_id: ID of the notebook to list section groups from
+        notebook_id: ID of the notebook
 
     Returns:
         JSON string containing section group information
     """
     try:
-        groups = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sectionGroups")
-        return json.dumps(_parse_section_groups(groups.get("value", [])), indent=2)
+        group_list = await make_graph_request_all(
+            f"/me/onenote/notebooks/{notebook_id}/sectionGroups"
+        )
+        return json.dumps(_parse_section_groups(group_list), indent=2)
     except Exception as e:
         return f"Error listing section groups: {str(e)}"
 
 @mcp.tool()
 async def list_sections_in_group(group_id: str) -> str:
     """
-    List sections inside a section group.
+    List sections directly inside a specific section group (one level,
+    non-recursive).
 
     Args:
         group_id: ID of the section group
@@ -580,143 +720,176 @@ async def list_sections_in_group(group_id: str) -> str:
         JSON string containing section information
     """
     try:
-        sections = await make_graph_request(f"/me/onenote/sectionGroups/{group_id}/sections")
-        return json.dumps(_parse_sections(sections.get("value", [])), indent=2)
+        section_list = await make_graph_request_all(
+            f"/me/onenote/sectionGroups/{group_id}/sections"
+        )
+        return json.dumps(_parse_sections(section_list), indent=2)
     except Exception as e:
         return f"Error listing sections in group: {str(e)}"
 
 @mcp.tool()
-async def list_sections(notebook_id: str) -> str:
+async def list_section_group_contents(section_group_id: str) -> str:
     """
-    List all sections in a notebook, including sections inside section groups.
-    Results from section groups include a group_name field.
+    List both sections and nested section groups inside a section group
+    (one level, non-recursive). Useful for building a lazy file-tree UI.
 
     Args:
-        notebook_id: ID of the notebook to list sections from
+        section_group_id: ID of the section group
 
     Returns:
-        JSON string containing section information
+        JSON with 'sections' and 'section_groups' arrays
     """
-    all_sections = []
-
-    # Root-level sections
     try:
-        resp = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sections")
-        all_sections.extend(_parse_sections(resp.get("value", [])))
-    except Exception:
-        pass
+        section_list = await make_graph_request_all(
+            f"/me/onenote/sectionGroups/{section_group_id}/sections"
+        )
+        nested_group_list = await make_graph_request_all(
+            f"/me/onenote/sectionGroups/{section_group_id}/sectionGroups"
+        )
 
-    # Sections inside section groups
-    try:
-        groups_resp = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sectionGroups")
-        for group in groups_resp.get("value", []):
-            group_id = group.get("id")
-            group_name = group.get("displayName")
-            try:
-                sections_resp = await make_graph_request(f"/me/onenote/sectionGroups/{group_id}/sections")
-                all_sections.extend(_parse_sections(sections_resp.get("value", []), group_name=group_name))
-            except Exception:
-                pass
-
-            # One level of nested groups
-            try:
-                nested_resp = await make_graph_request(f"/me/onenote/sectionGroups/{group_id}/sectionGroups")
-                for nested_group in nested_resp.get("value", []):
-                    nested_id = nested_group.get("id")
-                    nested_name = f"{group_name} > {nested_group.get('displayName')}"
-                    try:
-                        nested_sections_resp = await make_graph_request(f"/me/onenote/sectionGroups/{nested_id}/sections")
-                        all_sections.extend(_parse_sections(nested_sections_resp.get("value", []), group_name=nested_name))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return json.dumps(all_sections, indent=2)
+        return json.dumps({
+            "sections": _parse_sections(section_list),
+            "section_groups": _parse_section_groups(nested_group_list)
+        }, indent=2)
+    except Exception as e:
+        return f"Error listing section group contents: {str(e)}"
 
 @mcp.tool()
-async def get_notebook_structure(notebook_id: str) -> str:
+async def enumerate_notebook(
+    notebook_id: str,
+    include_pages: bool = False,
+    max_depth: int = DEFAULT_ENUM_DEPTH
+) -> str:
     """
-    Get the full structure of a notebook as a tree: root sections and section groups
-    with their sections, recursing one level into nested section groups.
+    Recursively enumerate the full structure of a notebook as a tree:
+    root sections plus all section groups with their (potentially nested)
+    sections, and optionally all pages within each section.
 
     Args:
-        notebook_id: ID of the notebook
+        notebook_id: ID of the notebook to enumerate
+        include_pages: If True, list pages within each section (slower)
+        max_depth: Soft recursion limit for nested section groups (default 10).
+                   Logs a warning if hit but does not error.
 
     Returns:
-        JSON string containing the full notebook tree
+        JSON tree with sections and section_groups (each potentially containing
+        further nested contents)
     """
-    async def build_group_tree(group_id: str, group_name: str) -> dict:
+    async def _enumerate_group(group_id: str, depth: int) -> Dict:
+        if depth > max_depth:
+            logger.warning(
+                f"enumerate_notebook: max_depth={max_depth} reached — "
+                f"deeper content will be omitted"
+            )
+            return {"error": f"Max nesting depth ({max_depth}) reached"}
+
+        sections_list = await make_graph_request_all(
+            f"/me/onenote/sectionGroups/{group_id}/sections"
+        )
+        nested_list = await make_graph_request_all(
+            f"/me/onenote/sectionGroups/{group_id}/sectionGroups"
+        )
+
         sections = []
-        nested_groups = []
+        for s in sections_list:
+            section_info = {
+                "id": s.get("id"),
+                "name": s.get("displayName"),
+                "modified": s.get("lastModifiedDateTime"),
+                "web_url": ((s.get("links") or {}).get("oneNoteWebUrl") or {}).get("href"),
+                "client_url": ((s.get("links") or {}).get("oneNoteClientUrl") or {}).get("href"),
+            }
+            if include_pages:
+                pages = await make_graph_request_all(
+                    f"/me/onenote/sections/{s['id']}/pages?$top=100"
+                )
+                section_info["pages"] = [
+                    {
+                        "id": p.get("id"),
+                        "title": p.get("title"),
+                        "modified": p.get("lastModifiedDateTime"),
+                        "content_url": p.get("contentUrl"),
+                        "web_url": ((p.get("links") or {}).get("oneNoteWebUrl") or {}).get("href"),
+                        "client_url": ((p.get("links") or {}).get("oneNoteClientUrl") or {}).get("href")
+                    }
+                    for p in pages
+                ]
+            sections.append(section_info)
 
-        try:
-            resp = await make_graph_request(f"/me/onenote/sectionGroups/{group_id}/sections")
-            sections = _parse_sections(resp.get("value", []))
-        except Exception:
-            pass
+        groups = []
+        for g in nested_list:
+            group_info = {
+                "id": g.get("id"),
+                "name": g.get("displayName"),
+                "modified": g.get("lastModifiedDateTime"),
+                "web_url": ((g.get("links") or {}).get("oneNoteWebUrl") or {}).get("href"),
+                "client_url": ((g.get("links") or {}).get("oneNoteClientUrl") or {}).get("href"),
+                "contents": await _enumerate_group(g["id"], depth + 1)
+            }
+            groups.append(group_info)
 
-        try:
-            nested_resp = await make_graph_request(f"/me/onenote/sectionGroups/{group_id}/sectionGroups")
-            for ng in nested_resp.get("value", []):
-                ng_id = ng.get("id")
-                ng_sections = []
-                try:
-                    ng_sections_resp = await make_graph_request(f"/me/onenote/sectionGroups/{ng_id}/sections")
-                    ng_sections = _parse_sections(ng_sections_resp.get("value", []))
-                except Exception:
-                    pass
-                nested_groups.append({
-                    "id": ng_id,
-                    "name": ng.get("displayName"),
-                    "sections": ng_sections,
-                    "section_groups": []
-                })
-        except Exception:
-            pass
-
-        return {
-            "id": group_id,
-            "name": group_name,
-            "sections": sections,
-            "section_groups": nested_groups
-        }
+        return {"sections": sections, "section_groups": groups}
 
     try:
-        # Get notebook name
-        notebook_resp = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}")
-        notebook_name = notebook_resp.get("displayName", notebook_id)
-    except Exception:
-        notebook_name = notebook_id
+        top_sections_list = await make_graph_request_all(
+            f"/me/onenote/notebooks/{notebook_id}/sections"
+        )
+        top_groups_list = await make_graph_request_all(
+            f"/me/onenote/notebooks/{notebook_id}/sectionGroups"
+        )
 
-    root_sections = []
-    try:
-        resp = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sections")
-        root_sections = _parse_sections(resp.get("value", []))
-    except Exception:
-        pass
+        top_sections = []
+        for s in top_sections_list:
+            section_info = {
+                "id": s.get("id"),
+                "name": s.get("displayName"),
+                "modified": s.get("lastModifiedDateTime"),
+                "web_url": ((s.get("links") or {}).get("oneNoteWebUrl") or {}).get("href"),
+                "client_url": ((s.get("links") or {}).get("oneNoteClientUrl") or {}).get("href"),
+            }
+            if include_pages:
+                pages = await make_graph_request_all(
+                    f"/me/onenote/sections/{s['id']}/pages?$top=100"
+                )
+                section_info["pages"] = [
+                    {
+                        "id": p.get("id"),
+                        "title": p.get("title"),
+                        "modified": p.get("lastModifiedDateTime"),
+                        "content_url": p.get("contentUrl"),
+                        "web_url": ((p.get("links") or {}).get("oneNoteWebUrl") or {}).get("href"),
+                        "client_url": ((p.get("links") or {}).get("oneNoteClientUrl") or {}).get("href")
+                    }
+                    for p in pages
+                ]
+            top_sections.append(section_info)
 
-    section_groups = []
-    try:
-        groups_resp = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sectionGroups")
-        for group in groups_resp.get("value", []):
-            section_groups.append(await build_group_tree(group.get("id"), group.get("displayName")))
+        top_groups = []
+        for g in top_groups_list:
+            group_info = {
+                "id": g.get("id"),
+                "name": g.get("displayName"),
+                "modified": g.get("lastModifiedDateTime"),
+                "web_url": ((g.get("links") or {}).get("oneNoteWebUrl") or {}).get("href"),
+                "client_url": ((g.get("links") or {}).get("oneNoteClientUrl") or {}).get("href"),
+                "contents": await _enumerate_group(g["id"], depth=1)
+            }
+            top_groups.append(group_info)
+
+        return json.dumps({
+            "sections": top_sections,
+            "section_groups": top_groups
+        }, indent=2)
+
     except Exception as e:
-        return f"Error getting notebook structure: {str(e)}"
-
-    return json.dumps({
-        "notebook_id": notebook_id,
-        "notebook_name": notebook_name,
-        "root_sections": root_sections,
-        "section_groups": section_groups
-    }, indent=2)
+        return f"Error enumerating notebook: {str(e)}"
 
 @mcp.tool()
 async def list_pages(section_id: str) -> str:
     """
-    List pages in a specific section.
+    List all pages in a specific section. Paginated — returns every page
+    regardless of count (works around OneNote's silent 100-record truncation).
+    Falls back to the SharePoint endpoint if the personal endpoint fails.
 
     Args:
         section_id: ID of the section to list pages from
@@ -725,52 +898,131 @@ async def list_pages(section_id: str) -> str:
         JSON string containing page information
     """
     def parse_pages(raw_list):
-        return [
-            {
+        out = []
+        for p in raw_list:
+            links = p.get("links") or {}
+            out.append({
                 "id": p.get("id"),
                 "title": p.get("title"),
                 "created": p.get("createdDateTime"),
                 "modified": p.get("lastModifiedDateTime"),
-                "content_url": p.get("contentUrl")
-            }
-            for p in raw_list
-        ]
+                "content_url": p.get("contentUrl"),
+                "web_url": (links.get("oneNoteWebUrl") or {}).get("href"),
+                "client_url": (links.get("oneNoteClientUrl") or {}).get("href")
+            })
+        return out
 
+    # Try personal endpoint first. Bind personal_err at outer scope so it
+    # stays visible after the except block (Python 3 clears `as` names).
+    personal_err: Optional[Exception] = None
     try:
-        pages = await make_graph_request(f"/me/onenote/sections/{section_id}/pages")
-        result = parse_pages(pages.get("value", []))
-        if result:
-            return json.dumps(result, indent=2)
-    except Exception as personal_err:
-        pass
-    else:
-        personal_err = None
+        pages = await make_graph_request_all(
+            f"/me/onenote/sections/{section_id}/pages?$top=100"
+        )
+        # Even if the list is empty, prefer the personal result unless an
+        # actual error occurred.
+        return json.dumps(parse_pages(pages), indent=2)
+    except Exception as e:
+        personal_err = e
+        logger.info(f"Personal list_pages failed, will try SharePoint: {e}")
 
-    # Fall back to SharePoint endpoint (handles sections in OneDrive for Business notebooks)
+    # Fall back to SharePoint endpoint (handles sections in OneDrive for
+    # Business notebooks where the /me/ endpoint 404s).
     site_id = await get_sharepoint_site_id()
     if site_id:
         try:
-            pages = await make_graph_request(
-                f"/sites/{site_id}/onenote/sections/{section_id}/pages"
+            pages = await make_graph_request_all(
+                f"/sites/{site_id}/onenote/sections/{section_id}/pages?$top=100"
             )
-            return json.dumps(parse_pages(pages.get("value", [])), indent=2)
+            return json.dumps(parse_pages(pages), indent=2)
         except Exception as sp_err:
-            if personal_err:
-                return f"Error listing pages (personal: {personal_err}; sharepoint: {sp_err})"
-            return f"Error listing pages from SharePoint: {sp_err}"
+            return (
+                f"Error listing pages (personal: {personal_err}; "
+                f"sharepoint: {sp_err})"
+            )
 
-    return json.dumps([], indent=2)
+    return f"Error listing pages: {personal_err}"
 
 @mcp.tool()
-async def get_page_content(page_id: str) -> str:
+async def debug_list_pages(
+    section_id: str,
+    top: int = 20,
+    orderby: str = "",
+    count: bool = False
+) -> str:
     """
-    Get the content of a specific page.
+    Diagnostic tool: list pages with custom query parameters to inspect
+    pagination behavior. Use this to investigate suspected truncation.
 
     Args:
-        page_id: ID of the page to retrieve content from
+        section_id: ID of the section
+        top: Number of results per page ($top parameter)
+        orderby: Sort order e.g. "createdDateTime asc" or
+                 "lastModifiedDateTime desc"
+        count: If true, request $count=true to get total count from API
 
     Returns:
-        Page content as HTML or error message
+        JSON with pages, total count, request count, and whether a nextLink
+        was present on any response
+    """
+    try:
+        if not await ensure_valid_token():
+            return "Not authenticated"
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+
+        params = f"$top={top}"
+        if orderby:
+            params += f"&$orderby={orderby}"
+        if count:
+            params += "&$count=true&ConsistencyLevel=eventual"
+
+        all_pages: List[Dict] = []
+        request_count = 0
+        odata_count: Any = None
+        had_next_link = False
+        url: Optional[str] = f"{GRAPH_BASE_URL}/me/onenote/sections/{section_id}/pages?{params}"
+
+        async with httpx.AsyncClient() as client:
+            while url:
+                request_count += 1
+                if count:
+                    headers["ConsistencyLevel"] = "eventual"
+                response = await client.get(url, headers=headers)
+                if response.status_code >= 400:
+                    return f"Error {response.status_code}: {response.text}"
+                data = response.json()
+                batch = data.get("value", [])
+                all_pages.extend(batch)
+                next_link = data.get("@odata.nextLink")
+                if next_link:
+                    had_next_link = True
+                odata_count = data.get("@odata.count", odata_count)
+                url = next_link
+
+        titles = [p.get("title", "untitled") for p in all_pages]
+        return json.dumps({
+            "total_returned": len(all_pages),
+            "odata_count": odata_count if count else "not requested",
+            "requests_made": request_count,
+            "had_next_link": had_next_link,
+            "first_title": titles[0] if titles else None,
+            "last_title": titles[-1] if titles else None,
+            "all_titles": titles
+        }, indent=2)
+
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+async def _fetch_page_content_html(page_id: str) -> str:
+    """Internal helper: fetch page HTML with SharePoint fallback.
+
+    Used by both the get_page_content @mcp.tool and get_page_resources.
+    Direct calls between @mcp.tool() functions fail with
+    "FunctionTool object is not callable" in fastmcp, so the body lives here.
     """
     if not await ensure_valid_token():
         return "Error: Not authenticated."
@@ -801,13 +1053,27 @@ async def get_page_content(page_id: str) -> str:
     return f"Error getting page content: page {page_id} not found via personal or SharePoint endpoints"
 
 @mcp.tool()
+async def get_page_content(page_id: str) -> str:
+    """
+    Get the HTML content of a specific page. Falls back to the SharePoint
+    endpoint if the personal endpoint returns an error.
+
+    Args:
+        page_id: ID of the page to retrieve content from
+
+    Returns:
+        Page content as HTML or error message
+    """
+    return await _fetch_page_content_html(page_id)
+
+@mcp.tool()
 async def get_page_resources(page_id: str) -> str:
     """
     Fetch and save all image/attachment resources embedded in a OneNote page.
 
-    Useful for pages with handwritten ink (Boox) or embedded images that don't
-    render as plain text.  Saves each resource as a file under
-    ~/.onenote_mcp_cache/<page_id>/ and returns a manifest of the saved paths.
+    Useful for pages with handwritten ink (Boox, Surface) or embedded images
+    that don't render as plain text. Saves each resource as a file under
+    ~/.onenote_mcp_cache/<page_id>/ and returns a manifest.
 
     Args:
         page_id: ID of the OneNote page
@@ -817,20 +1083,18 @@ async def get_page_resources(page_id: str) -> str:
     """
     import re
     import mimetypes
+    import hashlib
 
     if not await ensure_valid_token():
         return "Error: Not authenticated."
 
-    # Fetch page HTML content (reuse existing tool logic)
-    content_html = await get_page_content(page_id)
+    content_html = await _fetch_page_content_html(page_id)
     if content_html.startswith("Error"):
         return content_html
 
-    # Create cache directory
     cache_dir = Path.home() / ".onenote_mcp_cache" / page_id
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all Graph resource URLs embedded in img src / object data attributes
     resource_pattern = re.compile(
         r'https://graph\.microsoft\.com/v1\.0[^\s"\'<>]+/\$value',
         re.IGNORECASE
@@ -848,10 +1112,10 @@ async def get_page_resources(page_id: str) -> str:
                     logger.warning(f"Failed to fetch resource {url}: {response.status_code}")
                     continue
 
-                content_type = response.headers.get("content-type", "application/octet-stream").split(";")[0]
+                content_type = response.headers.get(
+                    "content-type", "application/octet-stream"
+                ).split(";")[0]
                 ext = mimetypes.guess_extension(content_type) or ".bin"
-                # Use a hash of the URL as the filename to avoid collisions
-                import hashlib
                 name = hashlib.md5(url.encode()).hexdigest()[:12] + ext
                 file_path = cache_dir / name
                 file_path.write_bytes(response.content)
@@ -879,32 +1143,27 @@ async def get_page_resources(page_id: str) -> str:
 async def clear_token_cache() -> str:
     """
     Clear the stored authentication tokens.
-    
+
     Returns:
         Status message
     """
     global access_token, refresh_token, token_expires_at
-    
+
     try:
-        # Clear in-memory tokens
         access_token = None
         refresh_token = None
         token_expires_at = None
-        
-        # Remove cache file
+
         if TOKEN_CACHE_FILE.exists():
             TOKEN_CACHE_FILE.unlink()
-            
+
         return json.dumps({
             "status": "success",
             "message": "Token cache cleared. You will need to re-authenticate."
         }, indent=2)
-        
+
     except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "error": str(e)
-        }, indent=2)
+        return json.dumps({"status": "error", "error": str(e)}, indent=2)
 
 @mcp.tool()
 async def restart_server() -> str:
@@ -916,7 +1175,6 @@ async def restart_server() -> str:
         Status message (sent before exit)
     """
     import threading
-    # Delay exit slightly so the response can be sent back to the client first
     threading.Timer(0.5, lambda: os._exit(0)).start()
     return json.dumps({"status": "restarting", "message": "Server is restarting..."}, indent=2)
 
@@ -924,11 +1182,11 @@ async def restart_server() -> str:
 async def create_notebook(name: str, description: str = None) -> str:
     """
     Create a new OneNote notebook.
-    
+
     Args:
         name: Name of the new notebook
         description: Optional description for the notebook
-    
+
     Returns:
         JSON string with the created notebook information
     """
@@ -936,10 +1194,10 @@ async def create_notebook(name: str, description: str = None) -> str:
         data = {"displayName": name}
         if description:
             data["description"] = description
-            
+
         notebook = await make_graph_request("/me/onenote/notebooks", method="POST", data=data)
-        
-        result = {
+
+        return json.dumps({
             "status": "success",
             "message": f"Notebook '{name}' created successfully",
             "notebook": {
@@ -947,10 +1205,8 @@ async def create_notebook(name: str, description: str = None) -> str:
                 "name": notebook.get("displayName"),
                 "created": notebook.get("createdDateTime")
             }
-        }
-        
-        return json.dumps(result, indent=2)
-    
+        }, indent=2)
+
     except Exception as e:
         return f"Error creating notebook: {str(e)}"
 
@@ -958,24 +1214,24 @@ async def create_notebook(name: str, description: str = None) -> str:
 async def create_section(notebook_id: str, name: str) -> str:
     """
     Create a new section in a OneNote notebook.
-    
+
     Args:
         notebook_id: ID of the notebook to create the section in
         name: Name of the new section
-    
+
     Returns:
         JSON string with the created section information
     """
     try:
         data = {"displayName": name}
-        
+
         section = await make_graph_request(
-            f"/me/onenote/notebooks/{notebook_id}/sections", 
-            method="POST", 
+            f"/me/onenote/notebooks/{notebook_id}/sections",
+            method="POST",
             data=data
         )
-        
-        result = {
+
+        return json.dumps({
             "status": "success",
             "message": f"Section '{name}' created successfully",
             "section": {
@@ -983,10 +1239,8 @@ async def create_section(notebook_id: str, name: str) -> str:
                 "name": section.get("displayName"),
                 "created": section.get("createdDateTime")
             }
-        }
-        
-        return json.dumps(result, indent=2)
-    
+        }, indent=2)
+
     except Exception as e:
         return f"Error creating section: {str(e)}"
 
@@ -994,19 +1248,17 @@ async def create_section(notebook_id: str, name: str) -> str:
 async def create_page(section_id: str, title: str, content_html: str = None) -> str:
     """
     Create a new page in a OneNote section.
-    
+
     Args:
         section_id: ID of the section to create the page in
         title: Title of the new page
         content_html: Optional HTML content for the page body
-    
+
     Returns:
         JSON string with the created page information
     """
     try:
-        # Build the HTML structure for the page
         if content_html:
-            # Ensure content is wrapped in proper OneNote HTML structure
             if not content_html.strip().startswith('<html>'):
                 page_html = f"""
 <!DOCTYPE html>
@@ -1025,7 +1277,6 @@ async def create_page(section_id: str, title: str, content_html: str = None) -> 
             else:
                 page_html = content_html
         else:
-            # Create a basic page with just the title
             page_html = f"""
 <!DOCTYPE html>
 <html>
@@ -1040,26 +1291,22 @@ async def create_page(section_id: str, title: str, content_html: str = None) -> 
     </div>
 </body>
 </html>"""
-        
-        # OneNote API expects multipart form data for page creation
+
         async with httpx.AsyncClient() as client:
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/xhtml+xml"
             }
-            
             response = await client.post(
                 f"{GRAPH_BASE_URL}/me/onenote/sections/{section_id}/pages",
                 headers=headers,
                 content=page_html
             )
-            
             if response.status_code >= 400:
                 return f"Error creating page: {response.status_code} - {response.text}"
-            
             page = response.json()
-        
-        result = {
+
+        return json.dumps({
             "status": "success",
             "message": f"Page '{title}' created successfully",
             "page": {
@@ -1068,28 +1315,29 @@ async def create_page(section_id: str, title: str, content_html: str = None) -> 
                 "created": page.get("createdDateTime"),
                 "content_url": page.get("contentUrl")
             }
-        }
-        
-        return json.dumps(result, indent=2)
-    
+        }, indent=2)
+
     except Exception as e:
         return f"Error creating page: {str(e)}"
 
 @mcp.tool()
-async def update_page_content(page_id: str, content_html: str, target_element: str = "body") -> str:
+async def update_page_content(
+    page_id: str,
+    content_html: str,
+    target_element: str = "body"
+) -> str:
     """
     Update the content of an existing OneNote page.
-    
+
     Args:
         page_id: ID of the page to update
         content_html: New HTML content to add/replace
         target_element: Target element to update (default: "body")
-    
+
     Returns:
         Status message
     """
     try:
-        # OneNote PATCH API for updating page content
         patch_data = [
             {
                 "target": target_element,
@@ -1097,47 +1345,46 @@ async def update_page_content(page_id: str, content_html: str, target_element: s
                 "content": content_html
             }
         ]
-        
+
         async with httpx.AsyncClient() as client:
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json"
             }
-            
             response = await client.patch(
                 f"{GRAPH_BASE_URL}/me/onenote/pages/{page_id}/content",
                 headers=headers,
                 json=patch_data
             )
-            
             if response.status_code >= 400:
                 return f"Error updating page: {response.status_code} - {response.text}"
-        
-        result = {
+
+        return json.dumps({
             "status": "success",
             "message": "Page content updated successfully",
             "page_id": page_id
-        }
-        
-        return json.dumps(result, indent=2)
-    
+        }, indent=2)
+
     except Exception as e:
         return f"Error updating page content: {str(e)}"
 
 def main():
     """Main entry point for the server."""
-    # Log token caching configuration
     cache_status = "enabled" if TOKEN_CACHE_ENABLED else "disabled"
     logger.info(f"OneNote MCP Server starting - Token caching: {cache_status}")
-    
+
     if TOKEN_CACHE_ENABLED:
         logger.info(f"Token cache file: {TOKEN_CACHE_FILE}")
-        # Try to load cached tokens on startup
         if load_tokens():
             logger.info("Cached tokens loaded successfully")
         else:
             logger.info("No valid cached tokens found")
-    
+
+    if SHAREPOINT_HOST and SHAREPOINT_USER_PATH:
+        logger.info(f"SharePoint support enabled: {SHAREPOINT_HOST}{SHAREPOINT_USER_PATH}")
+    else:
+        logger.info("SharePoint support disabled (SHAREPOINT_HOST / SHAREPOINT_USER_PATH not set)")
+
     mcp.run()
 
 if __name__ == "__main__":
