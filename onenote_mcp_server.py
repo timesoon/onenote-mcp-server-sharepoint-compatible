@@ -426,6 +426,58 @@ async def make_graph_request(endpoint: str, method: str = "GET", data: Dict = No
     
     return response.json()
 
+
+async def make_graph_request_all(endpoint: str) -> list:
+    """Make a paginated GET request to Microsoft Graph API.
+
+    Handles two pagination strategies:
+    1. Follow @odata.nextLink if the API provides one
+    2. Fall back to manual $skip pagination if nextLink is missing
+       (OneNote pages API silently truncates at 100 without nextLink)
+    """
+    if not await ensure_valid_token():
+        raise Exception("Not authenticated. Please call 'start_authentication' and 'complete_authentication' first.")
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    results = []
+    url = f"{GRAPH_BASE_URL}{endpoint}"
+    sep = "&" if "?" in endpoint else "?"
+    if "$top=" not in endpoint:
+        url += f"{sep}$top=100"
+
+    async with httpx.AsyncClient() as client:
+        while url:
+            response = await client.get(url, headers=headers)
+            if response.status_code >= 400:
+                raise Exception(f"Graph API error: {response.status_code} - {response.text}")
+            data = response.json()
+            batch = data.get("value", [])
+            results.extend(batch)
+
+            # Strategy 1: follow nextLink if provided
+            next_link = data.get("@odata.nextLink")
+            if next_link:
+                url = next_link
+                continue
+
+            # Strategy 2: manual $skip if we got a full page but no nextLink
+            # (OneNote pages API is known to omit nextLink)
+            if len(batch) > 0 and len(batch) >= 100:
+                base = f"{GRAPH_BASE_URL}{endpoint}"
+                skip_sep = "&" if "?" in endpoint else "?"
+                if "$top=" not in endpoint:
+                    base += f"{skip_sep}$top=100"
+                    skip_sep = "&"
+                url = f"{base}{skip_sep}$skip={len(results)}"
+            else:
+                url = None
+
+    return results
+
 @mcp.tool()
 async def list_notebooks() -> str:
     """
@@ -435,17 +487,20 @@ async def list_notebooks() -> str:
         JSON string containing notebook information
     """
     try:
-        logger.info("Making request to /me/onenote/notebooks")
-        notebooks = await make_graph_request("/me/onenote/notebooks")
-        logger.info(f"Graph API response received with {len(notebooks.get('value', []))} notebooks")
+        logger.info("Making paginated request to /me/onenote/notebooks")
+        notebook_list = await make_graph_request_all("/me/onenote/notebooks")
+        logger.info(f"Graph API response received with {len(notebook_list)} notebooks")
         
         result = []
-        for notebook in notebooks.get("value", []):
+        for notebook in notebook_list:
+            links = notebook.get("links") or {}
             result.append({
                 "id": notebook.get("id"),
                 "name": notebook.get("displayName"),
                 "created": notebook.get("createdDateTime"),
-                "modified": notebook.get("lastModifiedDateTime")
+                "modified": notebook.get("lastModifiedDateTime"),
+                "web_url": (links.get("oneNoteWebUrl") or {}).get("href"),
+                "client_url": (links.get("oneNoteClientUrl") or {}).get("href")
             })
         
         logger.info(f"Returning {len(result)} notebooks")
@@ -467,15 +522,18 @@ async def list_sections(notebook_id: str) -> str:
         JSON string containing section information
     """
     try:
-        sections = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sections")
+        section_list = await make_graph_request_all(f"/me/onenote/notebooks/{notebook_id}/sections")
         
         result = []
-        for section in sections.get("value", []):
+        for section in section_list:
+            links = section.get("links") or {}
             result.append({
                 "id": section.get("id"),
                 "name": section.get("displayName"),
                 "created": section.get("createdDateTime"),
-                "modified": section.get("lastModifiedDateTime")
+                "modified": section.get("lastModifiedDateTime"),
+                "web_url": (links.get("oneNoteWebUrl") or {}).get("href"),
+                "client_url": (links.get("oneNoteClientUrl") or {}).get("href")
             })
         
         return json.dumps(result, indent=2)
@@ -495,16 +553,19 @@ async def list_pages(section_id: str) -> str:
         JSON string containing page information
     """
     try:
-        pages = await make_graph_request(f"/me/onenote/sections/{section_id}/pages")
+        pages = await make_graph_request_all(f"/me/onenote/sections/{section_id}/pages?$top=100")
         
         result = []
-        for page in pages.get("value", []):
+        for page in pages:
+            links = page.get("links") or {}
             result.append({
                 "id": page.get("id"),
                 "title": page.get("title"),
                 "created": page.get("createdDateTime"),
                 "modified": page.get("lastModifiedDateTime"),
-                "content_url": page.get("contentUrl")
+                "content_url": page.get("contentUrl"),
+                "web_url": (links.get("oneNoteWebUrl") or {}).get("href"),
+                "client_url": (links.get("oneNoteClientUrl") or {}).get("href")
             })
         
         return json.dumps(result, indent=2)
